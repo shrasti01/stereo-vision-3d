@@ -1,0 +1,13 @@
+# Stereo Vision 3D Distance Measurement System - Requirements
+# Core dependencies
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# Configuration
+PyYAML>=6.0
+
+# Visualization (optional, for plotting)
+matplotlib>=3.7.0
+
+# For advanced stereo matching (optional)
+# opencv-contrib-python>=4.8.0  # Uncomment for ximgproc (WLS filter, right matcher)
