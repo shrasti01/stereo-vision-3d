@@ -31,3 +31,14 @@ data/**/*
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Security - never commit these
+*.pem
+*.key
+*.env
+.env
+.env.*
+config.yaml
+credentials.json
+secrets.json
+token*.txt

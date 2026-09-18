@@ -7,6 +7,7 @@ This module provides the command-line interface for the complete stereo vision p
 import argparse
 import sys
 import os
+import re
 from pathlib import Path
 from typing import Optional, List, Tuple
 
@@ -53,22 +54,179 @@ from src.utils.visualization import (
 )
 
 
+# ============================================================================
+# Security Validation Functions
+# ============================================================================
+
+def sanitize_path(path: str) -> str:
+    """
+    Sanitize file path to prevent path traversal attacks.
+    
+    Args:
+        path: Input path
+        
+    Returns:
+        Sanitized absolute path
+        
+    Raises:
+        ValueError: If path contains traversal attempts
+    """
+    # Block common traversal patterns
+    traversal_patterns = ['..', '~', '$', '`', '|', ';', '&', '>', '<']
+    for pattern in traversal_patterns:
+        if pattern in path:
+            raise ValueError(f"Invalid path: contains forbidden characters '{pattern}'")
+    
+    # Convert to absolute path and resolve
+    resolved = Path(path).resolve()
+    
+    # Ensure path is not trying to escape allowed directories
+    # Allow paths within current working directory or subdirectories
+    cwd = Path.cwd().resolve()
+    try:
+        resolved.relative_to(cwd)
+    except ValueError:
+        # Allow absolute paths if they exist
+        if not resolved.exists():
+            raise ValueError(f"Path does not exist: {path}")
+    
+    return str(resolved)
+
+
+def validate_roi(roi_str: str) -> bool:
+    """
+    Validate ROI specification format.
+    
+    Args:
+        roi_str: ROI string in format "x,y,w,h,label" or "x,y,r,label"
+        
+    Returns:
+        True if valid, False otherwise
+    """
+    parts = roi_str.split(',')
+    
+    if len(parts) not in (4, 5):
+        return False
+    
+    try:
+        # Check numeric values are integers
+        for part in parts[:3]:
+            val = int(part.strip())
+            if val < 0:
+                return False
+            if val > 10000:  # Reasonable max coordinate
+                return False
+        
+        # If 5 parts, last is label (alphanumeric + underscore only)
+        if len(parts) == 5:
+            label = parts[4].strip()
+            if not re.match(r'^[a-zA-Z0-9_]+$', label):
+                return False
+            if len(label) > 50:
+                return False
+        
+        return True
+    except ValueError:
+        return False
+
+
+def validate_algorithm(algorithm: str) -> bool:
+    """Validate algorithm name."""
+    return algorithm in ('sgbm', 'bm', 'sgbm_3way')
+
+
+def validate_calibration_params(pattern_size: List[int], square_size: float) -> Tuple[bool, str]:
+    """
+    Validate calibration parameters.
+    
+    Args:
+        pattern_size: Chessboard pattern size [cols, rows]
+        square_size: Square size in mm
+        
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    if len(pattern_size) != 2:
+        return False, "Pattern size must have exactly 2 values"
+    
+    cols, rows = pattern_size
+    if cols < 3 or cols > 20:
+        return False, f"Pattern columns must be between 3-20, got {cols}"
+    if rows < 3 or rows > 20:
+        return False, f"Pattern rows must be between 3-20, got {rows}"
+    
+    if square_size <= 0 or square_size > 1000:
+        return False, f"Square size must be between 0-1000mm, got {square_size}"
+    
+    return True, ""
+
+
+def safe_load_image(filepath: str) -> Optional[np.ndarray]:
+    """
+    Safely load an image with security checks.
+    
+    Args:
+        filepath: Path to image
+        
+    Returns:
+        Image array or None if failed
+    """
+    try:
+        safe_path = sanitize_path(filepath)
+    except ValueError as e:
+        print(f"Security error: {e}")
+        return None
+    
+    if not os.path.exists(safe_path):
+        print(f"Error: File not found: {safe_path}")
+        return None
+    
+    # Check file size (prevent DoS with huge files)
+    file_size = os.path.getsize(safe_path)
+    max_size = 100 * 1024 * 1024  # 100MB
+    if file_size > max_size:
+        print(f"Error: File too large ({file_size} bytes). Max allowed: {max_size} bytes")
+        return None
+    
+    image = cv2.imread(safe_path)
+    if image is None:
+        print(f"Error: Failed to load image: {safe_path}")
+        return None
+    
+    return image
+
+
 def run_calibration(args) -> int:
     """Run camera calibration."""
     print("Running stereo calibration...")
     
-    if not os.path.exists(args.left_calib) or not os.path.exists(args.right_calib):
+    # Validate calibration parameters
+    valid, error_msg = validate_calibration_params(args.pattern_size, args.square_size)
+    if not valid:
+        print(f"Error: Invalid calibration parameters: {error_msg}")
+        return 1
+    
+    # Validate paths
+    try:
+        left_calib = sanitize_path(args.left_calib)
+        right_calib = sanitize_path(args.right_calib)
+        output_dir = sanitize_path(args.output_dir)
+    except ValueError as e:
+        print(f"Security error: {e}")
+        return 1
+    
+    if not os.path.exists(left_calib) or not os.path.exists(right_calib):
         print(f"Error: Calibration directories not found:")
-        print(f"  Left: {args.left_calib}")
-        print(f"  Right: {args.right_calib}")
+        print(f"  Left: {left_calib}")
+        print(f"  Right: {right_calib}")
         return 1
     
     result = run_calibration_pipeline(
-        left_calib_dir=args.left_calib,
-        right_calib_dir=args.right_calib,
+        left_calib_dir=left_calib,
+        right_calib_dir=right_calib,
         pattern_size=tuple(args.pattern_size),
         square_size=args.square_size,
-        output_dir=args.output_dir,
+        output_dir=output_dir,
         visualize=args.visualize
     )
     
@@ -245,14 +403,19 @@ def run_stereo_pipeline(args) -> int:
         if args.roi:
             # User-specified ROIs
             for roi_spec in args.roi:
+                # Validate ROI format
+                if not validate_roi(roi_spec):
+                    print(f"  Invalid ROI format: {roi_spec}")
+                    continue
+                
                 # Format: x,y,w,ht,label or x,y,r,label for center point
                 parts = roi_spec.split(',')
                 if len(parts) == 5:
                     x, y, w, h, label = parts
-                    roi = create_rect_roi(int(x), int(y), int(w), int(h), label)
+                    roi = create_rect_roi(int(x), int(y), int(w), int(h), label.strip())
                 elif len(parts) == 4:
                     x, y, r, label = parts
-                    roi = create_center_point_roi(int(x), int(y), int(r), label)
+                    roi = create_center_point_roi(int(x), int(y), int(r), label.strip())
                 else:
                     print(f"  Invalid ROI format: {roi_spec}")
                     continue
